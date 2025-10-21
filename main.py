@@ -103,12 +103,22 @@ class LLMJudge(Judge):
             model=self._model,
             input=prompt,
             #temperature=self._temperature,
-            max_output_tokens=32,
+            #max_output_tokens=32,
         )
-        try:
-            content = response.output[0].content[0].text.strip().upper()  # type: ignore[attr-defined]
-        except (AttributeError, IndexError, ValueError):  # pragma: no cover - API fallback
-            content = getattr(response, "output_text", "").strip().upper()
+        content_text = ""
+        output = getattr(response, "output", None)
+        if output:
+            try:
+                first_item = output[0]
+                content_blocks = getattr(first_item, "content", None)
+                if content_blocks:
+                    content_text = (content_blocks[0].text or "").strip()
+            except (AttributeError, IndexError, TypeError):  # pragma: no cover - defensive
+                content_text = ""
+        if not content_text:
+            content_text = getattr(response, "output_text", "")
+        content = content_text.strip().upper()
+        #print(content)
         if content.startswith("A"):
             return 1
         if content.startswith("B"):
@@ -392,6 +402,24 @@ def main() -> int:
         weighted_score_sum_optimal = sum(
             score / idx for idx, score in enumerate(sorted_scores_desc, start=1)
         )
+        harmonic_sum = sum(1.0 / k for k in range(1, num_runs + 1)) if num_runs else 0.0
+        weighted_score_sum_random = (
+            (total_score / num_runs) * harmonic_sum if num_runs else 0.0
+        )
+        dcg_actual = sum(
+            rec["score"] / math.log2(rec["rank"] + 1) for rec in ranking_records if rec["rank"] > 0
+        )
+        dcg_optimal = sum(
+            score / math.log2(idx + 1) for idx, score in enumerate(sorted_scores_desc, start=1)
+        )
+        dcg_random = (
+            0.0
+            if num_runs == 0
+            else (total_score / num_runs)
+            * sum(1.0 / math.log2(k + 1) for k in range(1, num_runs + 1))
+        )
+        ndcg_actual = dcg_actual / dcg_optimal if dcg_optimal > 0 else 0.0
+        ndcg_random = dcg_random / dcg_optimal if dcg_optimal > 0 else 0.0
         rank_sum_optimal = sum(range(1, num_runs + 1)) if num_runs else 0
 
         artifact.append(
@@ -420,12 +448,21 @@ def main() -> int:
                 "rank_max": rank_max,
                 "weighted_score_sum": weighted_score_sum,
                 "weighted_score_sum_optimal": weighted_score_sum_optimal,
+                "weighted_score_sum_random": weighted_score_sum_random,
+                "dcg_actual": dcg_actual,
+                "dcg_optimal": dcg_optimal,
+                "dcg_random": dcg_random,
+                "ndcg_actual": ndcg_actual,
+                "ndcg_random": ndcg_random,
             }
         )
 
         print(
-            f"Weighted score sum (actual / optimal): "
-            f"{weighted_score_sum:.4f} / {weighted_score_sum_optimal:.4f}"
+            f"Weighted score sum (actual / optimal / random ~): "
+            f"{weighted_score_sum:.4f} / {weighted_score_sum_optimal:.4f} / {weighted_score_sum_random:.4f}"
+        )
+        print(
+            f"NDCG (actual / random ~): {ndcg_actual:.4f} / {ndcg_random:.4f}"
         )
         print()
 
