@@ -31,6 +31,7 @@ class RunCandidate:
 class Problem:
     problem_id: int
     statement: str
+    rubric: Sequence[Dict[str, Any]]
     runs: Sequence[RunCandidate]
 
 
@@ -88,10 +89,22 @@ class LLMJudge(Judge):
         return self._max_workers
 
     def compare(self, problem: Problem, run_a: RunCandidate, run_b: RunCandidate) -> int:
+        rubric_section = ""
+        if problem.rubric:
+            rubric_lines = []
+            for idx, item in enumerate(problem.rubric, start=1):
+                title = item.get("title") or ""
+                desc = item.get("description") or ""
+                max_points = item.get("max_points")
+                max_info = f" (max {max_points})" if max_points is not None else ""
+                rubric_lines.append(f"{idx}. {title}{max_info}: {desc}")
+            rubric_section = "Rubric:\n" + "\n".join(rubric_lines) + "\n\n"
+
         prompt = (
             "You are grading solutions to an IMO problem.\n"
             "Problem statement:\n"
             f"{problem.statement}\n\n"
+            f"{rubric_section}"
             "Compare the two solutions below and reply with a single character:\n"
             "'A' if Solution A is better, 'B' if Solution B is better, or 'T' if they are tied.\n\n"
             f"Solution A:\n"
@@ -155,11 +168,13 @@ def compute_pairwise_results(
     return results
 
 
-def load_dataset(dataset_key: str) -> List[Problem]:
-    if dataset_key not in DATASETS:
-        raise ValueError(f"Unknown dataset '{dataset_key}'. Available: {', '.join(DATASETS)}")
-
-    path = DATASETS[dataset_key]
+def load_dataset(dataset_key: str, custom_path: Path | None = None) -> List[Problem]:
+    if custom_path is not None:
+        path = custom_path
+    else:
+        if dataset_key not in DATASETS:
+            raise ValueError(f"Unknown dataset '{dataset_key}'. Available: {', '.join(DATASETS)}")
+        path = DATASETS[dataset_key]
     raw = json.loads(path.read_text())
 
     problems: List[Problem] = []
@@ -180,6 +195,7 @@ def load_dataset(dataset_key: str) -> List[Problem]:
             Problem(
                 problem_id=int(problem_entry["problem"]),
                 statement=problem_entry["statement"],
+                rubric=problem_entry.get("rubric", []),
                 runs=candidates,
             )
         )
@@ -331,6 +347,11 @@ def parse_args() -> argparse.Namespace:
         help="Maximum parallel requests when using the LLM judge (default: %(default)s).",
     )
     parser.add_argument(
+        "--solutions-json",
+        type=Path,
+        help="Override the dataset file path (e.g. use a sampled JSON).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="Optional path to save the ranked runs JSON artifact.",
@@ -345,7 +366,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    problems = load_dataset(args.dataset)
+    problems = load_dataset(args.dataset, args.solutions_json)
 
     if args.judge == "llm":
         judge: Judge = LLMJudge(args.llm_model, max_workers=args.llm_workers)

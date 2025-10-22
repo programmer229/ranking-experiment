@@ -102,9 +102,28 @@ def build_output_document(
                 {
                     "problem": problem,
                     "statement": trace.get("statement"),
+                    "rubric": [],
                     "models": {},
                 },
             )
+
+            if not problem_info["rubric"]:
+                rubric: List[Dict[str, Any]] = []
+                for output in trace.get("model_outputs", []):
+                    for judge in output.get("judgment", []) or []:
+                        for detail in judge.get("details", []) or []:
+                            rubric.append(
+                                {
+                                    "title": detail.get("title"),
+                                    "description": detail.get("grading_scheme_desc"),
+                                    "max_points": detail.get("max_points"),
+                                }
+                            )
+                        if rubric:
+                            break
+                    if rubric:
+                        break
+                problem_info["rubric"] = rubric
 
             runs: Dict[str, Dict[str, Any]] = {}
             for run_idx, output in enumerate(trace.get("model_outputs", []), start=1):
