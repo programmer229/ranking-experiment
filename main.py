@@ -4,6 +4,7 @@ import argparse
 import itertools
 import json
 import math
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,7 +100,6 @@ class LLMJudge(Judge):
                 max_info = f" (max {max_points})" if max_points is not None else ""
                 rubric_lines.append(f"{idx}. {title}{max_info}: {desc}")
             rubric_section = "Rubric:\n" + "\n".join(rubric_lines) + "\n\n"
-
         prompt = (
             "You are grading solutions to an IMO problem.\n"
             "Problem statement:\n"
@@ -139,6 +139,103 @@ class LLMJudge(Judge):
         return 0
 
 
+class LLMRubricScorer:
+    """Scores individual solutions using the rubric via an LLM."""
+
+    def __init__(self, model: str, temperature: float = 0.0, max_workers: int = 4) -> None:
+        try:
+            from openai import OpenAI  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "openai package not installed. Install `openai` to use the LLM judge."
+            ) from exc
+
+        api_key = Path(".openai-key").read_text().strip() if Path(".openai-key").exists() else None
+        if not api_key:
+            import os
+
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:  # pragma: no cover
+            raise RuntimeError(
+                "OPENAI_API_KEY not set and .openai-key file not found; cannot use LLM judge."
+            )
+
+        self._client = OpenAI(api_key=api_key)  # type: ignore
+        self._model = model
+        self._temperature = temperature
+        self._max_workers = max(1, max_workers)
+
+    @property
+    def max_workers(self) -> int:
+        return self._max_workers
+
+    def score(self, problem: Problem, run: RunCandidate) -> float:
+        rubric_lines = []
+        total_points = 0.0
+        for item in problem.rubric:
+            title = item.get("title") or ""
+            desc = item.get("description") or ""
+            max_points = item.get("max_points")
+            if max_points is None:
+                max_points = 1.0
+            total_points += max_points
+            rubric_lines.append(f"- {title} (max {max_points}): {desc}")
+        rubric_section = ""
+        if rubric_lines:
+            rubric_section = "Rubric:\n" + "\n".join(rubric_lines) + "\n\n"
+
+        prompt = (
+            "You are grading a solution to an IMO problem.\n"
+            "Evaluate the solution strictly according to the rubric and reply ONLY with a JSON object "
+            'containing a float field "total_score" and an array "per_item" with entries '
+            'that include "title", "awarded", "max", and "reason".\n'
+            f"The maximum total score is {total_points}. Partial credit is allowed.\n\n"
+            f"Problem statement:\n{problem.statement}\n\n"
+            f"{rubric_section}"
+            f"Solution:\n{run.solution}\n"
+        )
+
+        response = self._client.responses.create(  # type: ignore
+            model=self._model,
+            input=prompt,
+            temperature=self._temperature,
+            #max_output_tokens=256,
+        )
+
+        content_text = ""
+        output = getattr(response, "output", None)
+        if output:
+            try:
+                first_item = output[0]
+                content_blocks = getattr(first_item, "content", None)
+                if content_blocks:
+                    content_text = (content_blocks[0].text or "").strip()
+            except (AttributeError, IndexError, TypeError):
+                content_text = ""
+        if not content_text:
+            content_text = getattr(response, "output_text", "")
+
+        json_text = content_text.strip()
+        start = json_text.find("{")
+        end = json_text.rfind("}")
+        if start != -1 and end != -1:
+            json_text = json_text[start : end + 1]
+        try:
+            data = json.loads(json_text)
+        except json.JSONDecodeError:
+            return 0.0
+
+        total_score = data.get("total_score", 0.0)
+        try:
+            score = float(total_score)
+        except (TypeError, ValueError):
+            score = 0.0
+
+        if total_points > 0:
+            score = max(0.0, min(score, total_points))
+        return score
+
+
 def compute_pairwise_results(
     problem: Problem,
     candidates: Sequence[RunCandidate],
@@ -165,6 +262,29 @@ def compute_pairwise_results(
             i, j = pair
             results[pair] = judge.compare(problem, candidates[i], candidates[j])
 
+    return results
+
+
+def score_with_llm(
+    problem: Problem,
+    candidates: Sequence[RunCandidate],
+    scorer: LLMRubricScorer,
+) -> Dict[int, float]:
+    if not candidates:
+        return {}
+
+    results: Dict[int, float] = {}
+    with ThreadPoolExecutor(max_workers=scorer.max_workers) as executor:
+        futures = {
+            executor.submit(scorer.score, problem, candidates[idx]): idx
+            for idx in range(len(candidates))
+        }
+        for future in tqdm(as_completed(futures), total=len(futures), desc=f"Grading P{problem.problem_id}"):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception:
+                results[idx] = 0.0
     return results
 
 
@@ -277,6 +397,30 @@ def elo_rank_runs(
     return ordering, ratings
 
 
+def score_rank_runs(
+    candidates: Sequence[RunCandidate],
+    rng: random.Random,
+) -> Tuple[List[int], Dict[int, float]]:
+    if not candidates:
+        return [], {}
+
+    scores: Dict[int, float] = {idx: candidates[idx].score if candidates[idx].score is not None else 0.0 for idx in range(len(candidates))}
+    ordering = list(range(len(candidates)))
+    rng.shuffle(ordering)
+    ordering.sort(key=lambda idx: scores[idx], reverse=True)
+    return ordering, scores
+
+
+def rank_indices_by_metric(
+    metric_map: Mapping[int, float],
+    rng: random.Random,
+) -> List[int]:
+    ordering = list(metric_map.keys())
+    rng.shuffle(ordering)
+    ordering.sort(key=lambda idx: metric_map[idx], reverse=True)
+    return ordering
+
+
 def format_pairwise_table(
     problem: Problem,
     ordering: Sequence[int],
@@ -309,6 +453,22 @@ def format_elo_table(
     return "\n".join(lines)
 
 
+def format_score_table(
+    problem: Problem,
+    ordering: Sequence[int],
+    scores: Mapping[int, float],
+) -> str:
+    header = f"Problem {problem.problem_id} Score Rankings"
+    subheader = f"{'Rank':<4} {'Model':<25} {'Run':<6} {'Score':>7}"
+    lines = [header, subheader, "-" * len(subheader)]
+    for rank, idx in enumerate(ordering, start=1):
+        run = problem.runs[idx]
+        lines.append(
+            f"{rank:<4} {run.model:<25} {run.run_id:<6} {scores[idx]:>7.2f}"
+        )
+    return "\n".join(lines)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rank math competition models using different schemes.")
     parser.add_argument(
@@ -319,7 +479,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ranking-scheme",
-        choices=("pairwise", "elo"),
+        choices=("pairwise", "elo", "score", "llm_score"),
         default="pairwise",
         help="Ranking scheme to run (default: %(default)s).",
     )
@@ -352,6 +512,12 @@ def parse_args() -> argparse.Namespace:
         help="Override the dataset file path (e.g. use a sampled JSON).",
     )
     parser.add_argument(
+        "--score-seed",
+        type=int,
+        default=0,
+        help="Seed for tie-breaking in score-based ranking (default: %(default)s).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="Optional path to save the ranked runs JSON artifact.",
@@ -368,30 +534,43 @@ def main() -> int:
     args = parse_args()
     problems = load_dataset(args.dataset, args.solutions_json)
 
-    if args.judge == "llm":
-        judge: Judge = LLMJudge(args.llm_model, max_workers=args.llm_workers)
-    else:
-        judge = ScoreJudge()
+    judge: Judge | None = None
+    scorer: LLMRubricScorer | None = None
+    if args.ranking_scheme in {"pairwise", "elo"}:
+        if args.judge == "llm":
+            judge = LLMJudge(args.llm_model, max_workers=args.llm_workers)
+        else:
+            judge = ScoreJudge()
+    if args.ranking_scheme == "llm_score":
+        scorer = LLMRubricScorer(args.llm_model, max_workers=args.llm_workers)
 
     artifact: List[Dict[str, Any]] = []
     summary: List[Dict[str, Any]] = []
 
-    for problem in problems:
-        if len(problem.runs) <= 1:
-            ordering = list(range(len(problem.runs)))
-            wins: Dict[int, float] = {idx: 0.0 for idx in ordering}
-            ratings: Dict[int, float] = {idx: DEFAULT_ELO_RATING for idx in ordering}
-        elif args.ranking_scheme == "pairwise":
-            ordering, wins = pairwise_rank_runs(problem, problem.runs, judge)
-            ratings = {idx: None for idx in ordering}
-        else:
-            ordering, ratings = elo_rank_runs(problem.runs, judge, problem, args.k_factor)
-            wins = {idx: None for idx in ordering}
+    score_rng = random.Random(args.score_seed)
 
+    for problem in problems:
         if args.ranking_scheme == "pairwise":
-            print(format_pairwise_table(problem, ordering, wins))
+            if judge is None:
+                raise RuntimeError("Pairwise ranking requires a judge.")
+            ordering, metric_map = pairwise_rank_runs(problem, problem.runs, judge)
+            print(format_pairwise_table(problem, ordering, metric_map))
+        elif args.ranking_scheme == "elo":
+            if judge is None:
+                raise RuntimeError("Elo ranking requires a judge.")
+            ordering, metric_map = elo_rank_runs(problem.runs, judge, problem, args.k_factor)
+            print(format_elo_table(problem, ordering, metric_map))
+        elif args.ranking_scheme == "score":
+            ordering, metric_map = score_rank_runs(problem.runs, score_rng)
+            print(format_score_table(problem, ordering, metric_map))
+        elif args.ranking_scheme == "llm_score":
+            if scorer is None:
+                raise RuntimeError("LLM scoring requires an LLM rubric scorer.")
+            metric_map = score_with_llm(problem, problem.runs, scorer)
+            ordering = rank_indices_by_metric(metric_map, score_rng)
+            print(format_score_table(problem, ordering, metric_map))
         else:
-            print(format_elo_table(problem, ordering, ratings))
+            raise ValueError(f"Unsupported ranking scheme {args.ranking_scheme}")
 
         ranking_records: List[Dict[str, Any]] = []
         for position, idx in enumerate(ordering, start=1):
@@ -404,9 +583,11 @@ def main() -> int:
                 "solution": run.solution,
             }
             if args.ranking_scheme == "pairwise":
-                record["wins"] = wins.get(idx)
-            else:
-                record["rating"] = ratings.get(idx)
+                record["wins"] = metric_map.get(idx)
+            elif args.ranking_scheme == "elo":
+                record["rating"] = metric_map.get(idx)
+            elif args.ranking_scheme == "score":
+                record["score_rank_score"] = metric_map.get(idx)
             ranking_records.append(record)
 
         scores_all = [run.score for run in problem.runs]
@@ -415,32 +596,70 @@ def main() -> int:
         rank_sum_actual = sum(rec["rank"] for rec in ranking_records)
         rank_max = ranking_records[-1]["rank"] if ranking_records else 0
         num_runs = len(problem.runs)
-        weighted_score_sum = sum(
-            rec["score"] / rec["rank"] for rec in ranking_records if rec["rank"] > 0
+
+        indices = list(range(num_runs))
+        score_values = {
+            idx: scores_all[idx] if scores_all[idx] is not None else 0.0 for idx in indices
+        }
+        metric_values = {
+            idx: metric_map.get(idx, score_values[idx]) if metric_map else score_values[idx]
+            for idx in indices
+        }
+
+        harmonic_sum = sum(1.0 / k for k in range(1, num_runs + 1)) if num_runs else 0.0
+        harmonic_dcg_sum = (
+            sum(1.0 / math.log2(k + 1) for k in range(1, num_runs + 1)) if num_runs else 0.0
+        )
+
+        def weighted_sum(order: Sequence[int], values: Mapping[int, float]) -> float:
+            return sum(
+                values[idx] / rank for rank, idx in enumerate(order, start=1)
+            )
+
+        def dcg(order: Sequence[int], values: Mapping[int, float]) -> float:
+            return sum(
+                values[idx] / math.log2(rank + 1)
+                for rank, idx in enumerate(order, start=1)
+            )
+
+        def optimal_order(values: Mapping[int, float]) -> List[int]:
+            return sorted(values.keys(), key=lambda idx: (values[idx], -idx), reverse=True)
+
+        avg_score = total_score / num_runs if num_runs else 0.0
+        score_order_optimal = optimal_order(score_values)
+        weighted_score_sum_actual = weighted_sum(ordering, score_values)
+        weighted_score_sum_optimal = weighted_sum(score_order_optimal, score_values)
+        weighted_score_sum_random = avg_score * harmonic_sum
+
+        score_dcg_actual = dcg(ordering, score_values)
+        score_dcg_optimal = dcg(score_order_optimal, score_values)
+        score_dcg_random = avg_score * harmonic_dcg_sum
+        score_ndcg_actual = (
+            score_dcg_actual / score_dcg_optimal if score_dcg_optimal > 0 else 0.0
+        )
+        score_ndcg_random = (
+            score_dcg_random / score_dcg_optimal if score_dcg_optimal > 0 else 0.0
+        )
+
+        avg_metric = (
+            sum(metric_values.values()) / num_runs if num_runs else 0.0
+        )
+        metric_order_optimal = optimal_order(metric_values)
+        weighted_metric_sum_actual = weighted_sum(ordering, metric_values)
+        weighted_metric_sum_optimal = weighted_sum(metric_order_optimal, metric_values)
+        weighted_metric_sum_random = avg_metric * harmonic_sum
+
+        metric_dcg_actual = dcg(ordering, metric_values)
+        metric_dcg_optimal = dcg(metric_order_optimal, metric_values)
+        metric_dcg_random = avg_metric * harmonic_dcg_sum
+        metric_ndcg_actual = (
+            metric_dcg_actual / metric_dcg_optimal if metric_dcg_optimal > 0 else 0.0
+        )
+        metric_ndcg_random = (
+            metric_dcg_random / metric_dcg_optimal if metric_dcg_optimal > 0 else 0.0
         )
 
         sorted_scores_desc = sorted(scores_all, reverse=True)
-        weighted_score_sum_optimal = sum(
-            score / idx for idx, score in enumerate(sorted_scores_desc, start=1)
-        )
-        harmonic_sum = sum(1.0 / k for k in range(1, num_runs + 1)) if num_runs else 0.0
-        weighted_score_sum_random = (
-            (total_score / num_runs) * harmonic_sum if num_runs else 0.0
-        )
-        dcg_actual = sum(
-            rec["score"] / math.log2(rec["rank"] + 1) for rec in ranking_records if rec["rank"] > 0
-        )
-        dcg_optimal = sum(
-            score / math.log2(idx + 1) for idx, score in enumerate(sorted_scores_desc, start=1)
-        )
-        dcg_random = (
-            0.0
-            if num_runs == 0
-            else (total_score / num_runs)
-            * sum(1.0 / math.log2(k + 1) for k in range(1, num_runs + 1))
-        )
-        ndcg_actual = dcg_actual / dcg_optimal if dcg_optimal > 0 else 0.0
-        ndcg_random = dcg_random / dcg_optimal if dcg_optimal > 0 else 0.0
         rank_sum_optimal = sum(range(1, num_runs + 1)) if num_runs else 0
 
         artifact.append(
@@ -467,23 +686,38 @@ def main() -> int:
                 "rank_sum": rank_sum_actual,
                 "rank_sum_optimal": rank_sum_optimal,
                 "rank_max": rank_max,
-                "weighted_score_sum": weighted_score_sum,
+                "weighted_score_sum_actual": weighted_score_sum_actual,
                 "weighted_score_sum_optimal": weighted_score_sum_optimal,
                 "weighted_score_sum_random": weighted_score_sum_random,
-                "dcg_actual": dcg_actual,
-                "dcg_optimal": dcg_optimal,
-                "dcg_random": dcg_random,
-                "ndcg_actual": ndcg_actual,
-                "ndcg_random": ndcg_random,
+                "weighted_metric_sum_actual": weighted_metric_sum_actual,
+                "weighted_metric_sum_optimal": weighted_metric_sum_optimal,
+                "weighted_metric_sum_random": weighted_metric_sum_random,
+                "score_dcg_actual": score_dcg_actual,
+                "score_dcg_optimal": score_dcg_optimal,
+                "score_dcg_random": score_dcg_random,
+                "score_ndcg_actual": score_ndcg_actual,
+                "score_ndcg_random": score_ndcg_random,
+                "metric_dcg_actual": metric_dcg_actual,
+                "metric_dcg_optimal": metric_dcg_optimal,
+                "metric_dcg_random": metric_dcg_random,
+                "metric_ndcg_actual": metric_ndcg_actual,
+                "metric_ndcg_random": metric_ndcg_random,
             }
         )
 
         print(
-            f"Weighted score sum (actual / optimal / random ~): "
-            f"{weighted_score_sum:.4f} / {weighted_score_sum_optimal:.4f} / {weighted_score_sum_random:.4f}"
+            f"Weighted score sum (rubric actual / optimal / random ~): "
+            f"{weighted_score_sum_actual:.4f} / {weighted_score_sum_optimal:.4f} / {weighted_score_sum_random:.4f}"
         )
         print(
-            f"NDCG (actual / random ~): {ndcg_actual:.4f} / {ndcg_random:.4f}"
+            f"Weighted metric sum (rank metric actual / optimal / random ~): "
+            f"{weighted_metric_sum_actual:.4f} / {weighted_metric_sum_optimal:.4f} / {weighted_metric_sum_random:.4f}"
+        )
+        print(
+            f"NDCG score-based (actual / random ~): {score_ndcg_actual:.4f} / {score_ndcg_random:.4f}"
+        )
+        print(
+            f"NDCG metric-based (actual / random ~): {metric_ndcg_actual:.4f} / {metric_ndcg_random:.4f}"
         )
         print()
 
