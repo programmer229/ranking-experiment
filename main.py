@@ -457,15 +457,27 @@ def format_score_table(
     problem: Problem,
     ordering: Sequence[int],
     scores: Mapping[int, float],
+    metric_scores: Mapping[int, float] | None = None,
+    metric_label: str = "Rank Metric",
 ) -> str:
-    header = f"Problem {problem.problem_id} Score Rankings"
-    subheader = f"{'Rank':<4} {'Model':<25} {'Run':<6} {'Score':>7}"
-    lines = [header, subheader, "-" * len(subheader)]
-    for rank, idx in enumerate(ordering, start=1):
-        run = problem.runs[idx]
-        lines.append(
-            f"{rank:<4} {run.model:<25} {run.run_id:<6} {scores[idx]:>7.2f}"
-        )
+    if metric_scores is not None:
+        header = f"Problem {problem.problem_id} Score Rankings"
+        subheader = f"{'Rank':<4} {'Model':<25} {'Run':<6} {'Score':>7} {metric_label:>14}"
+        lines = [header, subheader, "-" * len(subheader)]
+        for rank, idx in enumerate(ordering, start=1):
+            run = problem.runs[idx]
+            lines.append(
+                f"{rank:<4} {run.model:<25} {run.run_id:<6} {scores[idx]:>7.2f} {metric_scores[idx]:>14.2f}"
+            )
+    else:
+        header = f"Problem {problem.problem_id} Score Rankings"
+        subheader = f"{'Rank':<4} {'Model':<25} {'Run':<6} {'Score':>7}"
+        lines = [header, subheader, "-" * len(subheader)]
+        for rank, idx in enumerate(ordering, start=1):
+            run = problem.runs[idx]
+            lines.append(
+                f"{rank:<4} {run.model:<25} {run.run_id:<6} {scores[idx]:>7.2f}"
+            )
     return "\n".join(lines)
 
 
@@ -562,13 +574,17 @@ def main() -> int:
             print(format_elo_table(problem, ordering, metric_map))
         elif args.ranking_scheme == "score":
             ordering, metric_map = score_rank_runs(problem.runs, score_rng)
-            print(format_score_table(problem, ordering, metric_map))
+            print(format_score_table(problem, ordering, metric_map, None))
         elif args.ranking_scheme == "llm_score":
             if scorer is None:
                 raise RuntimeError("LLM scoring requires an LLM rubric scorer.")
             metric_map = score_with_llm(problem, problem.runs, scorer)
             ordering = rank_indices_by_metric(metric_map, score_rng)
-            print(format_score_table(problem, ordering, metric_map))
+            original_scores = {
+                idx: problem.runs[idx].score if problem.runs[idx].score is not None else 0.0
+                for idx in range(len(problem.runs))
+            }
+            print(format_score_table(problem, ordering, original_scores, metric_map, metric_label="LLM Score"))
         else:
             raise ValueError(f"Unsupported ranking scheme {args.ranking_scheme}")
 
@@ -582,12 +598,17 @@ def main() -> int:
                 "score": run.score,
                 "solution": run.solution,
             }
+            metric_value = metric_map.get(idx) if metric_map else None
             if args.ranking_scheme == "pairwise":
                 record["wins"] = metric_map.get(idx)
             elif args.ranking_scheme == "elo":
                 record["rating"] = metric_map.get(idx)
             elif args.ranking_scheme == "score":
                 record["score_rank_score"] = metric_map.get(idx)
+            elif args.ranking_scheme == "llm_score":
+                record["llm_score"] = metric_map.get(idx)
+            if metric_value is not None:
+                record["rank_metric"] = metric_value
             ranking_records.append(record)
 
         scores_all = [run.score for run in problem.runs]
@@ -659,7 +680,7 @@ def main() -> int:
             metric_dcg_random / metric_dcg_optimal if metric_dcg_optimal > 0 else 0.0
         )
 
-        sorted_scores_desc = sorted(scores_all, reverse=True)
+        sorted_scores_desc = sorted(score_values.values(), reverse=True)
         rank_sum_optimal = sum(range(1, num_runs + 1)) if num_runs else 0
 
         artifact.append(
