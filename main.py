@@ -5,27 +5,151 @@ import itertools
 import json
 import math
 import random
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tqdm.auto import tqdm
 
 
-DATASETS: Mapping[str, Path] = {
+DATASETS: Dict[str, Path] = {
     "imo_2025": Path("imo_2025_solutions.json"),
+    "creative_writing": Path("creative_writing_dataset.json"),
 }
 
 DEFAULT_ELO_RATING = 1500.0
+
+IMO_COMPARE_GUIDELINES = textwrap.dedent(
+    """\
+You are an expert mathematician and a meticulous grader for an International Mathematical Olympiad (IMO) level exam. Your primary task is to rigorously verify each provided mathematical solution exactly as written. A solution is to be judged correct **only if every step is rigorously justified.** A solution that arrives at a correct final answer through flawed reasoning, educated guesses, or with gaps in its arguments must be flagged as incorrect or incomplete.
+### Instructions ###
+**1. Core Instructions**
+* Your sole task is to find and report all issues in the provided solution. You must act as a **verifier**, NOT a solver. **Do NOT attempt to correct the errors or fill the gaps you find.**
+* You must perform a **step-by-step** check of the entire solution. This analysis will be presented in a **Detailed Verification Log**, where you justify your assessment of each step: for correct steps, a brief justification suffices; for steps with errors or gaps, you must provide a detailed explanation.
+**2. How to Handle Issues in the Solution**
+When you identify an issue in a step, you MUST first classify it into one of the following two categories and then follow the specified procedure.
+* **a. Critical Error:** This is any error that breaks the logical chain of the proof. This includes both **logical fallacies** (e.g., claiming that ‘A > B, C > D’ implies ‘A - C > B - D’) and **factual errors** (e.g., a calculation error like ‘2 + 3 = 6’).
+  * **Procedure:** Explain the specific error and state that it **invalidates the current line of reasoning**. Do NOT check any further steps that rely on this error. You MUST, however, scan the rest of the solution to identify and verify any fully independent parts (such as disjoint cases).
+* **b. Justification Gap:** This is for steps where the conclusion may be correct, but the provided argument is incomplete, hand-wavy, or lacks sufficient rigor.
+  * **Procedure:** Explain the gap in the justification. State that you will **assume the step’s conclusion is true** for the sake of argument, and then proceed to verify all subsequent steps to check if the remainder of the argument is sound.
+### Output Format ###
+Your response MUST be structured into two main sections: a **Summary** followed by the **Detailed Verification Log**.
+**a. Summary**
+This section MUST be at the very beginning of your response. It must contain two components:
+* **Final Verdict:** A single, clear sentence declaring the overall validity of the solution. For example: "The solution is correct," "The solution contains a Critical Error and is therefore invalid," or "The solution’s approach is viable but contains several Justification Gaps."
+* **List of Findings:** A bulleted list that summarizes **every** issue you discovered. For each finding, you must provide:
+  * **Location:** A direct quote of the key phrase or equation where the issue occurs.
+  * **Issue:** A brief description of the problem and its classification (**Critical Error** or **Justification Gap**).
+**b. Detailed Verification Log**
+Following the summary, provide the full, step-by-step verification log as defined in the Core Instructions. When you refer to a specific part of the solution, **quote the relevant text** to make your reference clear before providing your detailed analysis of that part.
+### Example of the Required Summary Format ###
+*This is a generic example to illustrate the required format. Your findings must be based on the actual solution provided below.*
+**Final Verdict:** The solution is **invalid** because it contains a Critical Error.
+**List of Findings:**
+* **Location:** "By interchanging the limit and the integral, we get ..."
+* **Issue:** Justification Gap - The solution interchanges a limit and an integral without providing justification, such as proving uniform convergence.
+* **Location:** "From $A > B$ and $C > D$, it follows that $A - C > B - D$"
+* **Issue:** Critical Error - This step is a logical fallacy. Subtracting inequalities in this manner is not a valid mathematical operation.
+"""
+).strip()
+
+CREATIVE_COMPARE_GUIDELINES = textwrap.dedent(
+    """\
+You are an award-winning literary editor evaluating two short stories written in response to the same prompt. Judge each piece holistically, balancing creativity with technical execution. Consider:
+* Alignment with the prompt’s theme or constraints.
+* Originality of concept and strength of the narrative voice.
+* Structure, pacing, clarity, and cohesion of the storytelling.
+* Character or imagery development and the emotional journey offered to the reader.
+* Command of language, stylistic control, and polish.
+Identify strengths and weaknesses in both pieces before deciding which one is superior. Only declare a tie if the stories are nearly indistinguishable in overall quality or excel in complementary ways.""",
+).strip()
+
+IMO_SCORE_GUIDELINES = textwrap.dedent(
+    """\
+You are an expert mathematician and a meticulous grader for an International Mathematical Olympiad (IMO) level exam. Your primary task is to rigorously verify each provided mathematical solution exactly as written. A solution is to be judged correct **only if every step is rigorously justified.** A solution that arrives at a correct final answer through flawed reasoning, educated guesses, or with gaps in its arguments must be flagged as incorrect or incomplete.
+### Instructions ###
+**1. Core Instructions**
+* Your sole task is to find and report all issues in the provided solution. You must act as a **verifier**, NOT a solver. **Do NOT attempt to correct the errors or fill the gaps you find.**
+* You must perform a **step-by-step** check of the entire solution. This analysis will be presented in a **Detailed Verification Log**, where you justify your assessment of each step: for correct steps, a brief justification suffices; for steps with errors or gaps, you must provide a detailed explanation.
+**2. How to Handle Issues in the Solution**
+When you identify an issue in a step, you MUST first classify it into one of the following two categories and then follow the specified procedure.
+* **a. Critical Error:** This is any error that breaks the logical chain of the proof. This includes both **logical fallacies** (e.g., claiming that ‘A > B, C > D’ implies ‘A - C > B - D’) and **factual errors** (e.g., a calculation error like ‘2 + 3 = 6’).
+  * **Procedure:** Explain the specific error and state that it **invalidates the current line of reasoning**. Do NOT check any further steps that rely on this error. You MUST, however, scan the rest of the solution to identify and verify any fully independent parts (such as disjoint cases).
+* **b. Justification Gap:** This is for steps where the conclusion may be correct, but the provided argument is incomplete, hand-wavy, or lacks sufficient rigor.
+  * **Procedure:** Explain the gap in the justification. State that you will **assume the step’s conclusion is true** for the sake of argument, and then proceed to verify all subsequent steps to check if the remainder of the argument is sound.
+### Output Format ###
+Your response MUST be structured into two main sections: a **Summary** followed by the **Detailed Verification Log**.
+**a. Summary**
+This section MUST be at the very beginning of your response. It must contain two components:
+* **Final Verdict:** A single, clear sentence declaring the overall validity of the solution. For example: "The solution is correct," "The solution contains a Critical Error and is therefore invalid," or "The solution’s approach is viable but contains several Justification Gaps."
+* **List of Findings:** A bulleted list that summarizes **every** issue you discovered. For each finding, you must provide:
+  * **Location:** A direct quote of the key phrase or equation where the issue occurs.
+  * **Issue:** A brief description of the problem and its classification (**Critical Error** or **Justification Gap**).
+**b. Detailed Verification Log**
+Following the summary, provide the full, step-by-step verification log as defined in the Core Instructions. When you refer to a specific part of the solution, **quote the relevant text** to make your reference clear before providing your detailed analysis of that part.
+### Example of the Required Summary Format ###
+*This is a generic example to illustrate the required format. Your findings must be based on the actual solution provided below.*
+**Final Verdict:** The solution is **invalid** because it contains a Critical Error.
+**List of Findings:**
+* **Location:** "By interchanging the limit and the integral, we get ..."
+* **Issue:** Justification Gap - The solution interchanges a limit and an integral without providing justification, such as proving uniform convergence.
+* **Location:** "From $A > B$ and $C > D$, it follows that $A - C > B - D$"
+* **Issue:** Critical Error - This step is a logical fallacy. Subtracting inequalities in this manner is not a valid mathematical operation.
+### Rubric Scoring ###
+After completing the verification workflow, evaluate each rubric item. Award points between 0 and the specified maximum, granting partial credit only when the reasoning in the solution supports it. A rubric item that contains a Critical Error must receive 0 for the affected portion; a Justification Gap may receive partial credit if you explain why the remaining reasoning still supports some credit.
+### Response Format ###
+For this scoring interface, you must still perform the full analysis above, but you must NOT output the Summary or Detailed Verification Log. After you finish grading, respond **only** with a JSON object containing:
+* **"total_score"** — the sum of the awarded points (float).
+* **"per_item"** — an array of objects, one per rubric item, each with:
+  * **"title"** — the rubric item title.
+  * **"awarded"** — the points you are awarding (float).
+  * **"max"** — the maximum points available for that item (float).
+  * **"reason"** — a concise explanation referencing the findings that justify the awarded score.
+Ensure that "total_score" equals the sum of the "awarded" values.
+"""
+).strip()
+
+CREATIVE_SCORE_GUIDELINES = textwrap.dedent(
+    """\
+You are an award-winning literary editor providing a holistic evaluation of a short story written for the specified prompt. Score the piece on the following dimensions, awarding fractional credit as needed:
+1. Concept & Prompt Alignment (max 2.5): How well the story embraces the prompt and delivers a compelling concept.
+2. Narrative Craft & Structure (max 2.5): Cohesion, pacing, clarity, and overall storytelling craft.
+3. Character/Imagery & Emotional Impact (max 2.5): Depth of characters or imagery and the emotional journey provided.
+4. Style & Language (max 2.5): Command of language, voice, and stylistic polish.
+Document the reasoning behind each component score, then report a `total_score` out of 10.0 equal to the sum of the awarded points.
+### Response Format ###
+Respond **only** with a JSON object containing:
+* **"total_score"** — the sum of the awarded points (float).
+* **"per_item"** — an array of objects matching the rubric above, each with:
+  * **"title"** — the rubric item title.
+  * **"awarded"** — the points you are awarding (float).
+  * **"max"** — the maximum points available for that item (float).
+  * **"reason"** — a concise explanation referencing the findings that justify the awarded score.
+Ensure that "total_score" equals the sum of the "awarded" values.""",
+).strip()
+
+
+def get_compare_guidelines(dataset_key: str) -> str:
+    if dataset_key == "creative_writing":
+        return CREATIVE_COMPARE_GUIDELINES
+    return IMO_COMPARE_GUIDELINES
+
+
+def get_score_guidelines(dataset_key: str) -> str:
+    if dataset_key == "creative_writing":
+        return CREATIVE_SCORE_GUIDELINES
+    return IMO_SCORE_GUIDELINES
 
 
 @dataclass
 class RunCandidate:
     model: str
     run_id: str
-    score: float
+    score: Optional[float]
     solution: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -34,6 +158,36 @@ class Problem:
     statement: str
     rubric: Sequence[Dict[str, Any]]
     runs: Sequence[RunCandidate]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+def format_candidate_solution(run: RunCandidate) -> str:
+    """Combine metadata and solution text for prompting."""
+    details: List[str] = []
+
+    title = run.metadata.get("title")
+    if title:
+        details.append(f"Title: {title}")
+    author = run.metadata.get("author")
+    if author:
+        details.append(f"Author: {author}")
+    award = run.metadata.get("award")
+    if award:
+        details.append(f"Award: {award}")
+    source = run.metadata.get("source")
+    if source:
+        details.append(f"Source: {source}")
+
+    link = None
+    nested_meta = run.metadata.get("metadata")
+    if isinstance(nested_meta, Mapping):
+        link = nested_meta.get("story_url") or nested_meta.get("url")
+    if link:
+        details.append(f"URL: {link}")
+
+    if details:
+        return "\n".join(details + ["", run.solution])
+    return run.solution
 
 
 class Judge:
@@ -50,9 +204,13 @@ class ScoreJudge(Judge):
     """Fallback judge that compares runs using their numeric score."""
 
     def compare(self, problem: Problem, run_a: RunCandidate, run_b: RunCandidate) -> int:
-        if math.isclose(run_a.score, run_b.score):
+        score_a = run_a.score if run_a.score is not None else float("-inf")
+        score_b = run_b.score if run_b.score is not None else float("-inf")
+        if math.isfinite(score_a) and math.isfinite(score_b) and math.isclose(score_a, score_b):
             return 0
-        return 1 if run_a.score > run_b.score else -1
+        if score_a == score_b:
+            return 0
+        return 1 if score_a > score_b else -1
 
 
 class LLMJudge(Judge):
@@ -62,7 +220,14 @@ class LLMJudge(Judge):
     Requires the OpenAI Python package and a valid `OPENAI_API_KEY`.
     """
 
-    def __init__(self, model: str, temperature: float = 0.0, max_workers: int = 4) -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        dataset_key: str,
+        temperature: float = 0.0,
+        max_workers: int = 4,
+    ) -> None:
         try:
             from openai import OpenAI  # type: ignore
         except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
@@ -84,12 +249,14 @@ class LLMJudge(Judge):
         self._model = model
         self._temperature = temperature
         self._max_workers = max(1, max_workers)
+        self._dataset_key = dataset_key
 
     @property
     def max_workers(self) -> int:
         return self._max_workers
 
     def compare(self, problem: Problem, run_a: RunCandidate, run_b: RunCandidate) -> int:
+        guidelines = get_compare_guidelines(self._dataset_key)
         rubric_section = ""
         if problem.rubric:
             rubric_lines = []
@@ -99,24 +266,43 @@ class LLMJudge(Judge):
                 max_points = item.get("max_points")
                 max_info = f" (max {max_points})" if max_points is not None else ""
                 rubric_lines.append(f"{idx}. {title}{max_info}: {desc}")
-            rubric_section = "Rubric:\n" + "\n".join(rubric_lines) + "\n\n"
-        prompt = (
-            "You are grading solutions to an IMO problem.\n"
-            "Problem statement:\n"
-            f"{problem.statement}\n\n"
-            f"{rubric_section}"
-            "Compare the two solutions below and reply with a single character:\n"
-            "'A' if Solution A is better, 'B' if Solution B is better, or 'T' if they are tied.\n\n"
-            f"Solution A:\n"
-            f"{run_a.solution}\n\n"
-            f"Solution B:\n"
-            f"{run_b.solution}\n"
-        )
+            rubric_body = "\n".join(rubric_lines)
+            rubric_section = f"### Rubric ###\n{rubric_body}\n======================================================================\n"
+        if self._dataset_key == "creative_writing":
+            task_role = "a lead judge for a creative writing competition"
+            workflow_noun = "evaluation"
+            decision_focus = "creative quality, prompt alignment, and execution"
+        else:
+            task_role = "an IMO grader"
+            workflow_noun = "verification"
+            decision_focus = "rigor, correctness, and completeness"
+
+        prompt = textwrap.dedent(
+            f"""\
+{guidelines}
+
+======================================================================
+### Problem ###
+{problem.statement}
+======================================================================
+{rubric_section}### Solution A ###
+{format_candidate_solution(run_a)}
+======================================================================
+### Solution B ###
+{format_candidate_solution(run_b)}
+======================================================================
+### Verification Task Reminder ###
+Your task is to act as {task_role}. Independently perform the full {workflow_noun} workflow described above for **each** solution. Internally prepare the Summary and Detailed Log for Solution A and Solution B before making any comparison. Base your final decision solely on that analysis.
+For this interface, do NOT output the summaries or logs. Instead, decide which solution is superior in terms of {decision_focus}.
+Respond with a single character only:
+- A : Solution A is better.
+- B : Solution B is better.
+- T : The solutions are tied in quality.
+"""
+        ).strip()
         response = self._client.responses.create(  # type: ignore
             model=self._model,
             input=prompt,
-            #temperature=self._temperature,
-            #max_output_tokens=32,
         )
         content_text = ""
         output = getattr(response, "output", None)
@@ -142,7 +328,14 @@ class LLMJudge(Judge):
 class LLMRubricScorer:
     """Scores individual solutions using the rubric via an LLM."""
 
-    def __init__(self, model: str, temperature: float = 0.0, max_workers: int = 4) -> None:
+    def __init__(
+        self,
+        model: str,
+        *,
+        dataset_key: str,
+        temperature: float = 0.0,
+        max_workers: int = 4,
+    ) -> None:
         try:
             from openai import OpenAI  # type: ignore
         except ModuleNotFoundError as exc:  # pragma: no cover
@@ -164,15 +357,50 @@ class LLMRubricScorer:
         self._model = model
         self._temperature = temperature
         self._max_workers = max(1, max_workers)
+        self._dataset_key = dataset_key
 
     @property
     def max_workers(self) -> int:
         return self._max_workers
 
     def score(self, problem: Problem, run: RunCandidate) -> float:
+        guidelines = get_score_guidelines(self._dataset_key)
+        if problem.rubric:
+            effective_rubric = list(problem.rubric)
+        elif self._dataset_key == "creative_writing":
+            effective_rubric = [
+                {
+                    "title": "Concept & Prompt Alignment",
+                    "description": "How well the story embraces the prompt and delivers a compelling concept.",
+                    "max_points": 2.5,
+                },
+                {
+                    "title": "Narrative Craft & Structure",
+                    "description": "Cohesion, pacing, clarity, and overall storytelling craft.",
+                    "max_points": 2.5,
+                },
+                {
+                    "title": "Character/Imagery & Emotional Impact",
+                    "description": "Depth of characters or imagery and the emotional journey provided.",
+                    "max_points": 2.5,
+                },
+                {
+                    "title": "Style & Language",
+                    "description": "Voice, word choice, and stylistic polish.",
+                    "max_points": 2.5,
+                },
+            ]
+        else:
+            effective_rubric = [
+                {
+                    "title": "Overall Quality",
+                    "description": "Assess the overall correctness, completeness, and rigor of the solution.",
+                    "max_points": 10.0,
+                }
+            ]
         rubric_lines = []
         total_points = 0.0
-        for item in problem.rubric:
+        for item in effective_rubric:
             title = item.get("title") or ""
             desc = item.get("description") or ""
             max_points = item.get("max_points")
@@ -182,26 +410,31 @@ class LLMRubricScorer:
             rubric_lines.append(f"- {title} (max {max_points}): {desc}")
         rubric_section = ""
         if rubric_lines:
-            rubric_section = "Rubric:\n" + "\n".join(rubric_lines) + "\n\n"
+            rubric_body = "\n".join(rubric_lines)
+            rubric_section = f"### Rubric ###\n{rubric_body}\n======================================================================\n"
 
-        prompt = (
-            "You are grading a solution to an IMO problem.\n"
-            "Evaluate the solution strictly according to the rubric and reply ONLY with a JSON object "
-            'containing a float field "total_score" and an array "per_item" with entries '
-            'that include "title", "awarded", "max", and "reason".\n'
-            f"The maximum total score is {total_points}. Partial credit is allowed.\n\n"
-            f"Problem statement:\n{problem.statement}\n\n"
-            f"{rubric_section}"
-            f"Solution:\n{run.solution}\n"
-        )
+        prompt = textwrap.dedent(
+            f"""\
+{guidelines}
 
+======================================================================
+### Problem ###
+{problem.statement}
+======================================================================
+### Maximum Score ###
+The maximum possible score is {total_points}. Partial credit is allowed when justified by the solution.
+======================================================================
+{rubric_section}### Solution ###
+{format_candidate_solution(run)}
+======================================================================
+### Scoring Task Reminder ###
+Your task is to act as {"a lead judge for a creative writing competition" if self._dataset_key == "creative_writing" else "an IMO grader"}. Perform the full {"evaluation" if self._dataset_key == "creative_writing" else "verification"} workflow described above, then translate your findings into the rubric scores exactly as specified in the Response Format.
+"""
+        ).strip()
         response = self._client.responses.create(  # type: ignore
             model=self._model,
             input=prompt,
-            temperature=self._temperature,
-            #max_output_tokens=256,
         )
-
         content_text = ""
         output = getattr(response, "output", None)
         if output:
@@ -214,8 +447,8 @@ class LLMRubricScorer:
                 content_text = ""
         if not content_text:
             content_text = getattr(response, "output_text", "")
-
-        json_text = content_text.strip()
+        #print(content_text, 42)
+        json_text = content_text
         start = json_text.find("{")
         end = json_text.rfind("}")
         if start != -1 and end != -1:
@@ -302,13 +535,25 @@ def load_dataset(dataset_key: str, custom_path: Path | None = None) -> List[Prob
         candidates: List[RunCandidate] = []
         for model_name, runs in problem_entry["models"].items():
             for run_id, payload in sorted(runs.items()):
-                score = payload.get("score")
+                raw_score = payload.get("score")
+                score: Optional[float]
+                try:
+                    score = float(raw_score) if raw_score is not None else None
+                except (TypeError, ValueError):
+                    score = None
+                solution = payload.get("solve", "") or ""
+                metadata = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"solve", "score"}
+                }
                 candidates.append(
                     RunCandidate(
                         model=model_name,
                         run_id=run_id,
-                        score=float(score) if score is not None else 0.0,
-                        solution=payload.get("solve", ""),
+                        score=score,
+                        solution=solution,
+                        metadata=metadata,
                     )
                 )
         problems.append(
@@ -317,6 +562,7 @@ def load_dataset(dataset_key: str, custom_path: Path | None = None) -> List[Prob
                 statement=problem_entry["statement"],
                 rubric=problem_entry.get("rubric", []),
                 runs=candidates,
+                metadata=problem_entry.get("metadata", {}),
             )
         )
     return problems
@@ -431,8 +677,9 @@ def format_pairwise_table(
     lines = [header, subheader, "-" * len(subheader)]
     for rank, idx in enumerate(ordering, start=1):
         run = problem.runs[idx]
+        score_display = f"{run.score:>7.2f}" if run.score is not None else f"{'N/A':>7}"
         lines.append(
-            f"{rank:<4} {run.model:<25} {run.run_id:<6} {wins[idx]:>6.1f} {run.score:>7.2f}"
+            f"{rank:<4} {run.model:<25} {run.run_id:<6} {wins[idx]:>6.1f} {score_display}"
         )
     return "\n".join(lines)
 
@@ -447,8 +694,9 @@ def format_elo_table(
     lines = [header, subheader, "-" * len(subheader)]
     for rank, idx in enumerate(ordering, start=1):
         run = problem.runs[idx]
+        score_display = f"{run.score:>7.2f}" if run.score is not None else f"{'N/A':>7}"
         lines.append(
-            f"{rank:<4} {run.model:<25} {run.run_id:<6} {ratings[idx]:>8.1f} {run.score:>7.2f}"
+            f"{rank:<4} {run.model:<25} {run.run_id:<6} {ratings[idx]:>8.1f} {score_display}"
         )
     return "\n".join(lines)
 
@@ -482,7 +730,9 @@ def format_score_table(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Rank math competition models using different schemes.")
+    parser = argparse.ArgumentParser(
+        description="Rank candidate solutions using different schemes (supports math and creative writing datasets)."
+    )
     parser.add_argument(
         "--dataset",
         choices=DATASETS.keys(),
@@ -544,17 +794,27 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    problems = load_dataset(args.dataset, args.solutions_json)
+    dataset_override: Optional[Path] = args.solutions_json
+
+    problems = load_dataset(args.dataset, dataset_override)
 
     judge: Judge | None = None
     scorer: LLMRubricScorer | None = None
     if args.ranking_scheme in {"pairwise", "elo"}:
         if args.judge == "llm":
-            judge = LLMJudge(args.llm_model, max_workers=args.llm_workers)
+            judge = LLMJudge(
+                args.llm_model,
+                dataset_key=args.dataset,
+                max_workers=args.llm_workers,
+            )
         else:
             judge = ScoreJudge()
     if args.ranking_scheme == "llm_score":
-        scorer = LLMRubricScorer(args.llm_model, max_workers=args.llm_workers)
+        scorer = LLMRubricScorer(
+            args.llm_model,
+            dataset_key=args.dataset,
+            max_workers=args.llm_workers,
+        )
 
     artifact: List[Dict[str, Any]] = []
     summary: List[Dict[str, Any]] = []
@@ -598,6 +858,8 @@ def main() -> int:
                 "score": run.score,
                 "solution": run.solution,
             }
+            if run.metadata:
+                record["metadata"] = run.metadata
             metric_value = metric_map.get(idx) if metric_map else None
             if args.ranking_scheme == "pairwise":
                 record["wins"] = metric_map.get(idx)
@@ -611,7 +873,7 @@ def main() -> int:
                 record["rank_metric"] = metric_value
             ranking_records.append(record)
 
-        scores_all = [run.score for run in problem.runs]
+        scores_all = [run.score if run.score is not None else 0.0 for run in problem.runs]
         total_score = sum(scores_all)
         max_score = max(scores_all, default=0.0)
         rank_sum_actual = sum(rec["rank"] for rec in ranking_records)
@@ -619,9 +881,7 @@ def main() -> int:
         num_runs = len(problem.runs)
 
         indices = list(range(num_runs))
-        score_values = {
-            idx: scores_all[idx] if scores_all[idx] is not None else 0.0 for idx in indices
-        }
+        score_values = {idx: scores_all[idx] for idx in indices}
         metric_values = {
             idx: metric_map.get(idx, score_values[idx]) if metric_map else score_values[idx]
             for idx in indices
@@ -687,6 +947,7 @@ def main() -> int:
             {
                 "problem": problem.problem_id,
                 "statement": problem.statement,
+                "metadata": problem.metadata,
                 "ranking_scheme": args.ranking_scheme,
                 "k_factor": args.k_factor if args.ranking_scheme == "elo" else None,
                 "ranked_runs": ranking_records,
