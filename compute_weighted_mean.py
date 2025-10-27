@@ -23,7 +23,7 @@ def load_values(path: Path) -> Iterable[float]:
 
 
 def main() -> None:
-    summary_files = [Path("summary.json"), Path("summary2.json")]
+    summary_files = [Path("summary.json"), Path("summary2.json"), Path("summary_group.json"), Path("summary3.json")]
     all_values = []
     for path in summary_files:
         try:

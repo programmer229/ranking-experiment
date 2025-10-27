@@ -9,7 +9,7 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from tqdm.auto import tqdm
 
@@ -20,6 +20,17 @@ DATASETS: Dict[str, Path] = {
 }
 
 DEFAULT_ELO_RATING = 1500.0
+DEFAULT_GROUP_POINTS: List[float] = [1.0, 0.6, 0.2]
+
+
+def parse_group_points(value: str) -> List[float]:
+    try:
+        points = [float(part.strip()) for part in value.split(",") if part.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid group points '{value}': {exc}") from exc
+    if not points:
+        raise argparse.ArgumentTypeError("Group points must include at least one numeric value.")
+    return points
 
 IMO_COMPARE_GUIDELINES = textwrap.dedent(
     """\
@@ -324,6 +335,140 @@ Respond with a single character only:
             return -1
         return 0
 
+    def rank_group(
+        self,
+        problem: Problem,
+        runs: Sequence[RunCandidate],
+        *,
+        points_schedule: Sequence[float],
+    ) -> List[int]:
+        guidelines = get_compare_guidelines(self._dataset_key)
+        rubric_section = ""
+        if problem.rubric:
+            rubric_lines = []
+            for idx, item in enumerate(problem.rubric, start=1):
+                title = item.get("title") or ""
+                desc = item.get("description") or ""
+                max_points = item.get("max_points")
+                max_info = f" (max {max_points})" if max_points is not None else ""
+                rubric_lines.append(f"{idx}. {title}{max_info}: {desc}")
+            rubric_body = "\n".join(rubric_lines)
+            rubric_section = (
+                f"### Rubric ###\n{rubric_body}\n======================================================================\n"
+            )
+
+        if self._dataset_key == "creative_writing":
+            task_role = "a lead judge for a creative writing competition"
+            workflow_noun = "evaluation"
+            decision_focus = (
+                "creative quality, prompt alignment, and execution"
+            )
+        else:
+            task_role = "an IMO grader"
+            workflow_noun = "verification"
+            decision_focus = "rigor, correctness, and completeness"
+
+        labels = [chr(ord("A") + idx) for idx in range(len(runs))]
+        solution_sections = []
+        for label, run in zip(labels, runs):
+            solution_sections.append(
+                textwrap.dedent(
+                    f"""\
+### Solution {label} ###
+{format_candidate_solution(run)}
+======================================================================"""
+                ).strip()
+            )
+        solutions_block = "\n".join(solution_sections)
+        points_lines = [
+            f"Rank {rank_idx + 1}: {points_schedule[rank_idx]}"
+            for rank_idx in range(len(points_schedule))
+        ]
+        points_description = "\n".join(points_lines) if points_lines else "Rank 1: 1.0"
+
+        prompt = textwrap.dedent(
+            f"""\
+{guidelines}
+
+======================================================================
+### Problem ###
+{problem.statement}
+======================================================================
+{rubric_section}{solutions_block}
+======================================================================
+### Ranking Task Reminder ###
+Your task is to act as {task_role}. Independently perform the full {workflow_noun} workflow described above for **each** solution. After completing the internal analysis, produce a holistic ranking of the solutions in terms of {decision_focus}.
+
+Use the following target point schedule for guidance when ordering:
+{points_description}
+
+Return **only** a JSON object with this exact structure:
+{{
+  "placements": [
+    {{"label": "A", "rank": 1, "reason": "one short sentence"}},
+    {{"label": "B", "rank": 2, "reason": "one short sentence"}}
+  ]
+}}
+
+Rules:
+* Each solution label (A, B, …) must appear exactly once.
+* `rank` must be a positive integer (1 = best). Ties are allowed by giving the same rank to multiple labels.
+* Keep `reason` concise (≤ 20 words). Do not include other text outside the JSON object.
+"""
+        ).strip()
+
+        response = self._client.responses.create(  # type: ignore
+            model=self._model,
+            input=prompt,
+        )
+        content_text = ""
+        output = getattr(response, "output", None)
+        if output:
+            try:
+                first_item = output[0]
+                content_blocks = getattr(first_item, "content", None)
+                if content_blocks:
+                    content_text = (content_blocks[0].text or "").strip()
+            except (AttributeError, IndexError, TypeError):  # pragma: no cover - defensive
+                content_text = ""
+        if not content_text:
+            content_text = getattr(response, "output_text", "")
+
+        json_text = content_text.strip()
+        start = json_text.find("{")
+        end = json_text.rfind("}")
+        if start != -1 and end != -1:
+            json_text = json_text[start : end + 1]
+
+        ranks_by_label: Dict[str, int] = {}
+        try:
+            data = json.loads(json_text)
+            placements = data.get("placements", [])
+            if isinstance(placements, list):
+                for entry in placements:
+                    label = ""
+                    rank_value: Optional[int] = None
+                    if isinstance(entry, Mapping):
+                        label_value = entry.get("label")
+                        rank_raw = entry.get("rank")
+                        if isinstance(label_value, str):
+                            label = label_value.strip().upper()
+                        if isinstance(rank_raw, (int, float)):
+                            try:
+                                rank_value = int(rank_raw)
+                            except (TypeError, ValueError):
+                                rank_value = None
+                    if label and rank_value is not None and rank_value > 0:
+                        ranks_by_label[label] = rank_value
+        except json.JSONDecodeError:
+            ranks_by_label = {}
+
+        ranks: List[int] = []
+        default_rank = len(runs)
+        for label in labels:
+            ranks.append(ranks_by_label.get(label, default_rank))
+        return ranks
+
 
 class LLMRubricScorer:
     """Scores individual solutions using the rubric via an LLM."""
@@ -600,6 +745,201 @@ def pairwise_rank_runs(
     return ordering, wins
 
 
+def group_rank_runs(
+    problem: Problem,
+    candidates: Sequence[RunCandidate],
+    judge: Judge,
+    group_size: int,
+    points_schedule: Sequence[float],
+    rounds: int,
+    rng: random.Random,
+) -> Tuple[List[int], Dict[int, float]]:
+    if not candidates:
+        return [], {}
+
+    total_candidates = len(candidates)
+    adjusted_group_size = max(1, min(group_size, total_candidates))
+    effective_rounds = max(1, rounds)
+    is_llm_judge = isinstance(judge, LLMJudge)
+
+    pair_results: Dict[Tuple[int, int], int] = {}
+    if not is_llm_judge:
+        pair_results = compute_pairwise_results(
+            problem,
+            candidates,
+            judge,
+            desc=f"Group comparisons P{problem.problem_id}",
+        )
+
+    def points_for_rank(position: int) -> float:
+        if 0 <= position < len(points_schedule):
+            return points_schedule[position]
+        return 0.0
+
+    points: Dict[int, float] = {idx: 0.0 for idx in range(total_candidates)}
+    overall_wins: Dict[int, float] = {idx: 0.0 for idx in range(total_candidates)}
+    if not is_llm_judge:
+        for (i, j), verdict in pair_results.items():
+            if verdict == 0:
+                overall_wins[i] += 0.5
+                overall_wins[j] += 0.5
+            elif verdict > 0:
+                overall_wins[i] += 1.0
+            else:
+                overall_wins[j] += 1.0
+
+    round_indices: Sequence[int] | Iterable[int]
+    if effective_rounds > 1:
+        round_indices = tqdm(range(effective_rounds), desc=f"Group rounds P{problem.problem_id}", leave=False)
+    else:
+        round_indices = range(effective_rounds)
+
+    for _ in round_indices:
+        shuffled = list(range(total_candidates))
+        rng.shuffle(shuffled)
+        groups: List[List[int]] = []
+        for start in range(0, total_candidates, adjusted_group_size):
+            group_indices = shuffled[start : start + adjusted_group_size]
+            if group_indices:
+                groups.append(group_indices)
+
+        if is_llm_judge:
+            singles: List[int] = []
+            multi_groups: List[List[int]] = []
+            for group_indices in groups:
+                if len(group_indices) == 1:
+                    singles.append(group_indices[0])
+                else:
+                    multi_groups.append(group_indices)
+
+            for idx in singles:
+                points[idx] += points_for_rank(0)
+                overall_wins[idx] += 1.0
+
+            if multi_groups:
+                with ThreadPoolExecutor(max_workers=judge.max_workers) as executor:
+                    future_to_group = {
+                        executor.submit(
+                            judge.rank_group,
+                            problem,
+                            [candidates[idx] for idx in group_indices],
+                            points_schedule=points_schedule,
+                        ): group_indices
+                        for group_indices in multi_groups
+                    }
+                    for future in tqdm(
+                        as_completed(future_to_group),
+                        total=len(future_to_group),
+                        desc=f"Group evals P{problem.problem_id}",
+                        leave=False,
+                    ):
+                        group_indices = future_to_group[future]
+                        try:
+                            ranks = future.result()
+                        except Exception:
+                            ranks = []
+                        if len(ranks) != len(group_indices):
+                            ranks = [position + 1 for position in range(len(group_indices))]
+                        rank_pairs = [
+                            (idx, max(1, int(rank)))
+                            for idx, rank in zip(group_indices, ranks)
+                        ]
+                        ordered = sorted(rank_pairs, key=lambda pair: (pair[1], -pair[0]))
+                        rank_position = 0
+                        processed = 0
+                        while processed < len(ordered):
+                            current_idx, current_rank = ordered[processed]
+                            tie_group = [current_idx]
+                            processed += 1
+                            while processed < len(ordered) and ordered[processed][1] == current_rank:
+                                tie_group.append(ordered[processed][0])
+                                processed += 1
+
+                            span = list(range(rank_position, rank_position + len(tie_group)))
+                            total_points = sum(points_for_rank(pos) for pos in span)
+                            shared_points = total_points / len(tie_group) if tie_group else 0.0
+                            win_bonus = max(0.0, float(len(ordered) - current_rank + 1))
+                            for idx in tie_group:
+                                points[idx] += shared_points
+                                overall_wins[idx] += win_bonus
+                            rank_position += len(tie_group)
+        else:
+            def verdict_for_pair(a: int, b: int) -> int:
+                if a == b:
+                    return 0
+                i, j = sorted((a, b))
+                verdict = pair_results.get((i, j), 0)
+                return verdict if a == i else -verdict
+
+            for group_indices in groups:
+                if len(group_indices) == 1:
+                    idx = group_indices[0]
+                    points[idx] += points_for_rank(0)
+                    overall_wins[idx] += 1.0
+                    continue
+
+                local_wins: Dict[int, float] = {idx: 0.0 for idx in group_indices}
+                for a, b in itertools.combinations(group_indices, 2):
+                    verdict = verdict_for_pair(a, b)
+                    if verdict == 0:
+                        local_wins[a] += 0.5
+                        local_wins[b] += 0.5
+                    elif verdict > 0:
+                        local_wins[a] += 1.0
+                    else:
+                        local_wins[b] += 1.0
+
+                ordered_by_win = sorted(
+                    group_indices,
+                    key=lambda idx: (local_wins[idx], -idx),
+                    reverse=True,
+                )
+                rank_position = 0
+                processed = 0
+                while processed < len(ordered_by_win):
+                    current_idx = ordered_by_win[processed]
+                    current_win = local_wins[current_idx]
+                    tie_group = [current_idx]
+                    processed += 1
+                    while processed < len(ordered_by_win) and math.isclose(
+                        local_wins[ordered_by_win[processed]],
+                        current_win,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    ):
+                        tie_group.append(ordered_by_win[processed])
+                        processed += 1
+
+                    span = list(range(rank_position, rank_position + len(tie_group)))
+                    total_points = sum(points_for_rank(pos) for pos in span)
+                    shared_points = total_points / len(tie_group) if tie_group else 0.0
+                    for idx in tie_group:
+                        points[idx] += shared_points
+                    rank_position += len(tie_group)
+
+    if is_llm_judge:
+        for idx in range(total_candidates):
+            overall_wins[idx] = max(overall_wins[idx], 0.0)
+
+    def candidate_score(idx: int) -> float:
+        score_val = candidates[idx].score
+        if score_val is None:
+            return float("-inf")
+        return score_val
+
+    ordering = sorted(
+        range(total_candidates),
+        key=lambda idx: (
+            points[idx],
+            overall_wins[idx],
+            candidate_score(idx),
+            -idx,
+        ),
+        reverse=True,
+    )
+    return ordering, points
+
+
 def elo_expected_score(rating_a: float, rating_b: float) -> float:
     return 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
 
@@ -729,6 +1069,23 @@ def format_score_table(
     return "\n".join(lines)
 
 
+def format_group_table(
+    problem: Problem,
+    ordering: Sequence[int],
+    points: Mapping[int, float],
+) -> str:
+    header = f"Problem {problem.problem_id} Group Rankings"
+    subheader = f"{'Rank':<4} {'Model':<25} {'Run':<6} {'Points':>7} {'Score':>7}"
+    lines = [header, subheader, "-" * len(subheader)]
+    for rank, idx in enumerate(ordering, start=1):
+        run = problem.runs[idx]
+        score_val = run.score if run.score is not None else 0.0
+        lines.append(
+            f"{rank:<4} {run.model:<25} {run.run_id:<6} {points.get(idx, 0.0):>7.2f} {score_val:>7.2f}"
+        )
+    return "\n".join(lines)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Rank candidate solutions using different schemes (supports math and creative writing datasets)."
@@ -741,7 +1098,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ranking-scheme",
-        choices=("pairwise", "elo", "score", "llm_score"),
+        choices=("pairwise", "elo", "score", "llm_score", "group"),
         default="pairwise",
         help="Ranking scheme to run (default: %(default)s).",
     )
@@ -780,6 +1137,23 @@ def parse_args() -> argparse.Namespace:
         help="Seed for tie-breaking in score-based ranking (default: %(default)s).",
     )
     parser.add_argument(
+        "--group-size",
+        type=int,
+        default=3,
+        help="Group size when --ranking-scheme=group (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--group-rounds",
+        type=int,
+        default=5,
+        help="Number of random groupings per problem when --ranking-scheme=group (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--group-points",
+        type=parse_group_points,
+        help="Comma-separated point weights for group ranking (default: 1.0,0.6,0.2).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="Optional path to save the ranked runs JSON artifact.",
@@ -800,7 +1174,7 @@ def main() -> int:
 
     judge: Judge | None = None
     scorer: LLMRubricScorer | None = None
-    if args.ranking_scheme in {"pairwise", "elo"}:
+    if args.ranking_scheme in {"pairwise", "elo", "group"}:
         if args.judge == "llm":
             judge = LLMJudge(
                 args.llm_model,
@@ -820,6 +1194,11 @@ def main() -> int:
     summary: List[Dict[str, Any]] = []
 
     score_rng = random.Random(args.score_seed)
+    if args.group_size < 1:
+        raise ValueError("--group-size must be at least 1.")
+    if args.group_rounds < 1:
+        raise ValueError("--group-rounds must be at least 1.")
+    group_points = list(args.group_points) if args.group_points is not None else list(DEFAULT_GROUP_POINTS)
 
     for problem in problems:
         if args.ranking_scheme == "pairwise":
@@ -832,6 +1211,19 @@ def main() -> int:
                 raise RuntimeError("Elo ranking requires a judge.")
             ordering, metric_map = elo_rank_runs(problem.runs, judge, problem, args.k_factor)
             print(format_elo_table(problem, ordering, metric_map))
+        elif args.ranking_scheme == "group":
+            if judge is None:
+                raise RuntimeError("Group ranking requires a judge.")
+            ordering, metric_map = group_rank_runs(
+                problem,
+                problem.runs,
+                judge,
+                args.group_size,
+                group_points,
+                args.group_rounds,
+                score_rng,
+            )
+            print(format_group_table(problem, ordering, metric_map))
         elif args.ranking_scheme == "score":
             ordering, metric_map = score_rank_runs(problem.runs, score_rng)
             print(format_score_table(problem, ordering, metric_map, None))
@@ -865,6 +1257,8 @@ def main() -> int:
                 record["wins"] = metric_map.get(idx)
             elif args.ranking_scheme == "elo":
                 record["rating"] = metric_map.get(idx)
+            elif args.ranking_scheme == "group":
+                record["group_points"] = metric_map.get(idx)
             elif args.ranking_scheme == "score":
                 record["score_rank_score"] = metric_map.get(idx)
             elif args.ranking_scheme == "llm_score":
@@ -950,6 +1344,9 @@ def main() -> int:
                 "metadata": problem.metadata,
                 "ranking_scheme": args.ranking_scheme,
                 "k_factor": args.k_factor if args.ranking_scheme == "elo" else None,
+                "group_size": args.group_size if args.ranking_scheme == "group" else None,
+                "group_rounds": args.group_rounds if args.ranking_scheme == "group" else None,
+                "group_points": group_points if args.ranking_scheme == "group" else None,
                 "ranked_runs": ranking_records,
             }
         )
@@ -984,6 +1381,9 @@ def main() -> int:
                 "metric_dcg_random": metric_dcg_random,
                 "metric_ndcg_actual": metric_ndcg_actual,
                 "metric_ndcg_random": metric_ndcg_random,
+                "group_size": args.group_size if args.ranking_scheme == "group" else None,
+                "group_rounds": args.group_rounds if args.ranking_scheme == "group" else None,
+                "group_points": group_points if args.ranking_scheme == "group" else None,
             }
         )
 

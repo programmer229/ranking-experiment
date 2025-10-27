@@ -8,6 +8,22 @@ if [[ ! -f "${DATASET_PATH}" ]]; then
   echo "Provide a creative-writing dataset JSON (e.g. from scrape_reedsy.py)." >&2
   exit 1
 fi
+python main.py \
+  --dataset creative_writing \
+  --solutions-json "${DATASET_PATH}" \
+  --ranking-scheme group \
+  --judge llm \
+  --summary-output summary_group.json \
+  --llm-model gpt-5-nano
+
+
+python main.py \
+  --dataset creative_writing \
+  --solutions-json "${DATASET_PATH}" \
+  --ranking-scheme elo \
+  --judge llm \
+  --summary-output summary3.json \
+  --llm-model gpt-5-nano
 
 python main.py \
   --dataset creative_writing \
@@ -27,4 +43,5 @@ python main.py \
   --llm-model gpt-5-nano
 
 echo "Pairwise summary -> summary.json"
+echo "Group summary    -> summary_group.json"
 echo "Score summary    -> summary2.json"
